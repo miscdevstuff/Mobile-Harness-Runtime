@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -30,6 +31,10 @@ from config import (
 )
 
 JOBS = str(max(2, multiprocessing.cpu_count()))
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def find_ndk_toolchain() -> Path:
@@ -88,7 +93,7 @@ def make_ndk_env(toolchain: Path) -> dict[str, str]:
 
 
 def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
-    print(f"[cmd] ({cwd.name}) {' '.join(cmd)}")
+    log(f"[cmd] ({cwd.name}) {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(cwd), env=env, check=True)
 
 
@@ -215,7 +220,7 @@ def build_static_deps(env: dict[str, str]) -> None:
     run(["make", f"-j{JOBS}"], cwd=ffi_src, env=env)
     run(["make", "install"], cwd=ffi_src, env=env)
 
-    # 6. sqlite3 (direct amalgamation build so autotools/autosetup changes never break CI)
+    # 6. sqlite3 (direct amalgamation build)
     sqlite_src = SRC_DIR / "sqlite"
     run(
         [
@@ -249,7 +254,7 @@ def build_static_deps(env: dict[str, str]) -> None:
     shutil.copy2(sqlite_src / "sqlite3ext.h", DEPS_PREFIX / "include/sqlite3ext.h")
     write_pkgconfig("sqlite3", "SQLite database engine", "3.49.1", "-lsqlite3 -lm")
 
-    # 7. OpenSSL (static libcrypto.a & libssl.a so zero symbol clash with Android /apex libssl.so)
+    # 7. OpenSSL (static libcrypto.a & libssl.a)
     ssl_src = SRC_DIR / "openssl"
     run(
         [
@@ -258,8 +263,10 @@ def build_static_deps(env: dict[str, str]) -> None:
             f"--prefix={DEPS_PREFIX}",
             f"--openssldir={DEPS_PREFIX}/ssl",
             "no-shared",
+            "no-async",
             "no-tests",
             "no-ui-console",
+            "no-docs",
             "-fPIC",
         ],
         cwd=ssl_src,
@@ -287,6 +294,8 @@ def patch_proot_sources(proot_src: Path) -> None:
         if "MH_REL_TMP_PATCH" not in txt:
             helper = r"""
 /* MH_REL_TMP_PATCH */
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -312,12 +321,10 @@ static const char *mh_default_tmp_dir(void) {
             txt = helper + "\n" + txt.replace('"/tmp"', "mh_default_tmp_dir()", 1)
             temp_c.write_text(txt, encoding="utf-8")
 
-    auxv_c = proot_src / "src/execve/auxv.c"
-    if auxv_c.is_file():
-        txt = auxv_c.read_text(encoding="utf-8")
-        if "MH_REL_LOADER_PATCH" not in txt and 'getenv("PROOT_LOADER")' in txt:
-            helper = r"""
+    loader_helper = r"""
 /* MH_REL_LOADER_PATCH */
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <limits.h>
 static const char *mh_resolve_bundled_loader(void) {
@@ -340,17 +347,30 @@ static const char *mh_resolve_bundled_loader(void) {
     return NULL;
 }
 """
+    for exec_c in (proot_src / "src/execve").glob("*.c"):
+        txt = exec_c.read_text(encoding="utf-8")
+        if "MH_REL_LOADER_PATCH" not in txt and 'getenv("PROOT_LOADER")' in txt:
             txt = (
-                helper
+                loader_helper
                 + "\n"
-                + txt.replace(
-                    'getenv("PROOT_LOADER")', "mh_resolve_bundled_loader()", 1
-                )
+                + txt.replace('getenv("PROOT_LOADER")', "mh_resolve_bundled_loader()")
             )
-            auxv_c.write_text(txt, encoding="utf-8")
+            exec_c.write_text(txt, encoding="utf-8")
 
 
-def build_proot(env: dict[str, str]) -> None:
+def parse_talloc_version(talloc_src: Path, resolved: dict) -> tuple[int, int, int]:
+    talloc_h = (talloc_src / "talloc.h").read_text(encoding="utf-8")
+    m_maj = re.search(r"#define\s+TALLOC_VERSION_MAJOR\s+(\d+)", talloc_h)
+    m_min = re.search(r"#define\s+TALLOC_VERSION_MINOR\s+(\d+)", talloc_h)
+    ver_str = resolved.get("deps", {}).get("talloc", "2.4.3")
+    parts = [int(x) for x in re.findall(r"\d+", ver_str)]
+    major = int(m_maj.group(1)) if m_maj else (parts[0] if len(parts) > 0 else 2)
+    minor = int(m_min.group(1)) if m_min else (parts[1] if len(parts) > 1 else 5)
+    release = parts[2] if len(parts) > 2 else 0
+    return major, minor, release
+
+
+def build_proot(env: dict[str, str], resolved: dict) -> None:
     """Builds static-linked proot + 16KB-aligned prootloader."""
     proot_src = SRC_DIR / "proot"
     shmem_src = SRC_DIR / "libandroid-shmem"
@@ -370,19 +390,27 @@ def build_proot(env: dict[str, str]) -> None:
     work = BUILD_DIR / "proot-build"
     work.mkdir(parents=True, exist_ok=True)
 
-    # 1. Create standalone POSIX replace.h shim for upstream talloc.c and compile libtalloc.a
+    # 1. Create standalone POSIX/C23 replace.h shim for talloc.c and compile libtalloc.a
+    t_maj, t_min, t_rel = parse_talloc_version(talloc_src, resolved)
     (work / "replace.h").write_text(
         "#ifndef _REPLACE_H\n#define _REPLACE_H\n"
         "#include <stdlib.h>\n#include <stdio.h>\n#include <string.h>\n"
         "#include <stdarg.h>\n#include <stdint.h>\n#include <stdbool.h>\n"
         "#include <errno.h>\n#include <unistd.h>\n#include <sys/types.h>\n"
         "#include <limits.h>\n#include <dlfcn.h>\n"
+        "#define HAVE_VA_COPY 1\n"
+        "#define HAVE_CONSTRUCTOR_ATTRIBUTE 1\n"
         "#ifndef _PUBLIC_\n#define _PUBLIC_\n#endif\n"
         "#ifndef _PRINTF_ATTRIBUTE\n#define _PRINTF_ATTRIBUTE(a,b)\n#endif\n"
         "#ifndef MIN\n#define MIN(a,b) ((a)<(b)?(a):(b))\n#endif\n"
         "#ifndef MAX\n#define MAX(a,b) ((a)>(b)?(a):(b))\n#endif\n"
         "#ifndef discard_const_p\n#define discard_const_p(type, ptr) ((type *)((intptr_t)(ptr)))\n#endif\n"
-        "#ifndef talloc_steal\n#endif\n"
+        "static inline void *mh_memset_explicit(void *s, int c, size_t n) {\n"
+        "    volatile unsigned char *p = (volatile unsigned char *)s;\n"
+        "    while (n--) *p++ = (unsigned char)c;\n"
+        "    return s;\n"
+        "}\n"
+        "#ifndef memset_explicit\n#define memset_explicit mh_memset_explicit\n#endif\n"
         "#endif\n",
         encoding="utf-8",
     )
@@ -393,9 +421,9 @@ def build_proot(env: dict[str, str]) -> None:
             "-fPIC",
             "-D_GNU_SOURCE",
             "-D__STDC_WANT_LIB_EXT1__=1",
-            "-DTALLOC_BUILD_VERSION_MAJOR=2",
-            "-DTALLOC_BUILD_VERSION_MINOR=4",
-            "-DTALLOC_BUILD_VERSION_RELEASE=3",
+            f"-DTALLOC_BUILD_VERSION_MAJOR={t_maj}",
+            f"-DTALLOC_BUILD_VERSION_MINOR={t_min}",
+            f"-DTALLOC_BUILD_VERSION_RELEASE={t_rel}",
             f"-I{work}",
             f"-I{talloc_src}",
             "-c",
@@ -413,13 +441,9 @@ def build_proot(env: dict[str, str]) -> None:
     )
 
     # 2. Compile static libandroid-shmem.a
-    shmem_c = next(shmem_src.rglob("shmem.c"))
-    shmem_inc = shmem_c.parent
-    u_Shm = shmem_c.read_text(encoding="utf-8")
-    if "ashmem_create_region" in u_Shm:
-        c_sources = [str(p) for p in shmem_src.rglob("*.c")]
-    else:
-        c_sources = [str(shmem_c)]
+    shm_h = next(shmem_src.rglob("shm.h"))
+    shm_inc_dirs = [f"-I{shm_h.parent}", f"-I{shm_h.parent.parent}", f"-I{shmem_src}"]
+    c_sources = sorted(shmem_src.rglob("*.c"))
     shmem_objs = []
     for idx, c_file in enumerate(c_sources):
         obj = work / f"shmem_{idx}.o"
@@ -428,11 +452,10 @@ def build_proot(env: dict[str, str]) -> None:
                 cc,
                 "-O2",
                 "-fPIC",
-                f"-I{shmem_inc}",
-                f"-I{shmem_src}",
+                *shm_inc_dirs,
                 '-D_PATH_TMP="/tmp/"',
                 "-c",
-                c_file,
+                str(c_file),
                 "-o",
                 str(obj),
             ],
@@ -444,13 +467,11 @@ def build_proot(env: dict[str, str]) -> None:
 
     # 3. Build 16KB page-aligned static prootloader
     loader_bin = out_libexec / "loader"
+    loader_arch_cflags = ["-fPIC", "-ffreestanding", "-O2", f"-I{proot_src / 'src'}"]
     run(
         [
             cc,
-            "-fPIC",
-            "-ffreestanding",
-            "-O2",
-            f"-I{proot_src / 'src'}",
+            *loader_arch_cflags,
             str(proot_src / "src/loader/loader.c"),
             str(proot_src / "src/loader/assembly.S"),
             "-static",
@@ -464,98 +485,54 @@ def build_proot(env: dict[str, str]) -> None:
         env=env,
     )
 
-    # 4. Generate build.h and loader-info.c
+    # 4. Generate build.h and loader-info.c (extracting offset_to_pokedata_workaround before stripping loader)
+    sym_out = subprocess.check_output(
+        [readelf, "-s", "-W", str(loader_bin)], text=True, env=env
+    )
+    syms: dict[str, int] = {}
+    for line in sym_out.splitlines():
+        parts = line.split()
+        if len(parts) >= 8 and parts[7] in ("pokedata_workaround", "_start"):
+            syms[parts[7]] = int(parts[1], 16)
+    assert "pokedata_workaround" in syms and "_start" in syms, (
+        f"Failed to find pokedata_workaround / _start in loader symbol table:\n{sym_out}"
+    )
+    pokedata_offset = syms["pokedata_workaround"] - syms["_start"]
+    log(f"[proot] Computed offset_to_pokedata_workaround = {pokedata_offset}")
+
     (work / "build.h").write_text(
         '#ifndef BUILD_H\n#define BUILD_H\n#define VERSION "5.1.107"\n'
         "#define HAVE_PROCESS_VM 1\n#define HAVE_SECCOMP_FILTER 1\n#endif\n",
         encoding="utf-8",
     )
-    (work / "loader-info.c").write_bytes(
-        b"const unsigned char _binary_loader_exe_start[] = { 0 };\n"
-        b"const unsigned char _binary_loader_exe_end[] = { 0 };\n"
-        b"const unsigned char loader_exe[] = { 0 };\n"
-        b"const unsigned int loader_exe_len = 0;\n"
+    (work / "loader-info.c").write_text(
+        "#include <sys/types.h>\n"
+        f"const ssize_t offset_to_pokedata_workaround = {pokedata_offset};\n"
+        "const unsigned char _binary_loader_exe_start[] = { 0 };\n"
+        "const unsigned char _binary_loader_exe_end[] = { 0 };\n"
+        "const unsigned char loader_exe[] = { 0 };\n"
+        "const unsigned int loader_exe_len = 0;\n",
+        encoding="utf-8",
     )
 
-    # 5. Compile all proot sources and link statically against libtalloc.a + libandroid-shmem.a
-    proot_c_files = [
-        "cli/cli.c",
-        "cli/proot.c",
-        "cli/note.c",
-        "execve/enter.c",
-        "execve/exit.c",
-        "execve/shebang.c",
-        "execve/elf.c",
-        "execve/ldso.c",
-        "execve/auxv.c",
-        "execve/aoxp.c",
-        "path/binding.c",
-        "path/glue.c",
-        "path/canon.c",
-        "path/path.c",
-        "path/proc.c",
-        "path/temp.c",
-        "syscall/seccomp.c",
-        "syscall/syscall.c",
-        "syscall/chain.c",
-        "syscall/enter.c",
-        "syscall/exit.c",
-        "syscall/sysnum.c",
-        "syscall/socket.c",
-        "syscall/heap.c",
-        "syscall/rlimit.c",
-        "tracee/tracee.c",
-        "tracee/mem.c",
-        "tracee/reg.c",
-        "tracee/event.c",
-        "tracee/seccomp.c",
-        "tracee/statx.c",
-        "ptrace/ptrace.c",
-        "ptrace/user.c",
-        "ptrace/wait.c",
-        "extension/extension.c",
-        "extension/kompat/kompat.c",
-        "extension/fake_id0/chown.c",
-        "extension/fake_id0/chroot.c",
-        "extension/fake_id0/getsockopt.c",
-        "extension/fake_id0/sendmsg.c",
-        "extension/fake_id0/socket.c",
-        "extension/fake_id0/open.c",
-        "extension/fake_id0/unlink.c",
-        "extension/fake_id0/rename.c",
-        "extension/fake_id0/chmod.c",
-        "extension/fake_id0/utimensat.c",
-        "extension/fake_id0/access.c",
-        "extension/fake_id0/exec.c",
-        "extension/fake_id0/link.c",
-        "extension/fake_id0/symlink.c",
-        "extension/fake_id0/mk.c",
-        "extension/fake_id0/stat.c",
-        "extension/fake_id0/helper_functions.c",
-        "extension/fake_id0/fake_id0.c",
-        "extension/sysvipc/sysvipc.c",
-        "extension/sysvipc/sysvipc_msg.c",
-        "extension/sysvipc/sysvipc_sem.c",
-        "extension/sysvipc/sysvipc_shm.c",
-        "extension/link2symlink/link2symlink.c",
-    ]
-    for opt_src in [
-        "path/f2fs-bug.c",
-        "syscall/pipe_shadow.c",
-        "extension/ashmem_memfd/ashmem_memfd.c",
-        "extension/hidden_files/hidden_files.c",
-        "extension/mountinfo/mountinfo.c",
-        "extension/port_switch/port_switch.c",
-        "extension/fix_symlink_size/fix_symlink_size.c",
-    ]:
-        if (proot_src / "src" / opt_src).is_file():
-            proot_c_files.append(opt_src)
+    # 5. Collect proot C sources (from GNUmakefile if present, else standard list)
+    gnumakefile = proot_src / "src/GNUmakefile"
+    src_paths: list[str] = []
+    if gnumakefile.is_file():
+        mk_txt = gnumakefile.read_text(encoding="utf-8")
+        for m in re.finditer(r"([a-zA-Z0-9_/-]+)\.o\b", mk_txt):
+            rel_base = m.group(1)
+            if "loader" in rel_base:
+                continue
+            candidate = proot_src / "src" / f"{rel_base}.c"
+            if candidate.is_file() and str(candidate) not in src_paths:
+                src_paths.append(str(candidate))
 
-    src_paths = [
-        str(proot_src / "src" / rel)
-        for rel in proot_c_files
-        if (proot_src / "src" / rel).is_file()
-    ]
+    if not src_paths:
+        for c_path in sorted((proot_src / "src").rglob("*.c")):
+            if "loader" not in c_path.parts:
+                src_paths.append(str(c_path))
+
     src_paths.append(str(work / "loader-info.c"))
 
     proot_bin = out_bin / "proot"
@@ -571,12 +548,11 @@ def build_proot(env: dict[str, str]) -> None:
             f"-I{proot_src / 'src'}",
             f"-I{work}",
             f"-I{talloc_src}",
-            f"-I{shmem_inc}",
-            f"-I{shmem_src}",
+            *shm_inc_dirs,
             "-include",
             "string.h",
             "-include",
-            str(shmem_inc / "shm.h"),
+            str(shm_h),
             *src_paths,
             str(work / "libtalloc.a"),
             str(work / "libandroid-shmem.a"),
@@ -613,8 +589,16 @@ def build_python314(env: dict[str, str]) -> None:
         encoding="utf-8",
     )
 
+    pkg_config_static = BUILD_DIR / "pkg-config-static"
+    pkg_config_static.write_text(
+        '#!/bin/sh\nexec /usr/bin/pkg-config --static "$@"\n',
+        encoding="utf-8",
+    )
+    pkg_config_static.chmod(0o755)
+
     py_env = env.copy()
     py_env["CONFIG_SITE"] = str(config_site)
+    py_env["PKG_CONFIG"] = str(pkg_config_static)
     py_env["LDFLAGS"] = (
         f"-L{DEPS_PREFIX}/lib {PAGE_SIZE_LDFLAGS} "
         "-Wl,-rpath,\\$ORIGIN/../lib -Wl,--enable-new-dtags"
@@ -640,12 +624,10 @@ def build_python314(env: dict[str, str]) -> None:
     run(["make", f"-j{JOBS}"], cwd=py_src, env=py_env)
     run(["make", "install"], cwd=py_src, env=py_env)
 
-    # Ensure bin/python3 symlink exists
     py3_link = USR_DIR / "bin/python3"
     if not py3_link.exists():
         py3_link.symlink_to("python3.14")
 
-    # Prune unneeded stdlib bloat (tkinter, idlelib, turtledemo, config-* static lib)
     py_lib = USR_DIR / "lib/python3.14"
     for bloat in ["idlelib", "tkinter", "turtledemo", "test", "pydoc_data"]:
         target = py_lib / bloat
@@ -760,10 +742,10 @@ def package_and_manifest(resolved: dict) -> None:
     }
     manifest_path = DIST_DIR / MANIFEST_NAME
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(
+    log(
         f"[ok] Built {archive_path.name} ({size_bytes / 1_048_576:.2f} MB, sha256={sha256})"
     )
-    print(f"[ok] Wrote {manifest_path.name}:\n{json.dumps(manifest, indent=2)}")
+    log(f"[ok] Wrote {manifest_path.name}:\n{json.dumps(manifest, indent=2)}")
 
 
 def main() -> None:
@@ -778,7 +760,7 @@ def main() -> None:
     env = make_ndk_env(toolchain)
 
     build_static_deps(env)
-    build_proot(env)
+    build_proot(env, resolved)
     build_python314(env)
     install_proot_distro_and_certs(resolved)
     package_and_manifest(resolved)
