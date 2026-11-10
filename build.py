@@ -21,7 +21,6 @@ from config import (
     GITHUB_REPOSITORY,
     MANIFEST_NAME,
     PAGE_SIZE_LDFLAGS,
-    RELEASE_TAG,
     RESOLVED_VERSIONS_FILE,
     ROOT_DIR,
     SRC_DIR,
@@ -329,7 +328,9 @@ static const char *mh_default_tmp_dir(void) {
                 txt = (
                     rel_tmp_helper
                     + "\n"
-                    + txt.replace('"/tmp"', "mh_default_tmp_dir()")
+                    + txt.replace("P_tmpdir", "mh_default_tmp_dir()").replace(
+                        '"/tmp"', "mh_default_tmp_dir()"
+                    )
                 )
                 target_c.write_text(txt, encoding="utf-8")
 
@@ -673,7 +674,7 @@ def build_python314(env: dict[str, str]) -> None:
         if cfg_dir.is_dir():
             shutil.rmtree(cfg_dir)
 
-    # Remove duplicate .opt-1.pyc and .opt-2.pyc bytecode files to save ~4 MB
+    # Remove duplicate .opt-1.pyc and .opt-2.pyc bytecode files
     for opt_pyc in py_lib.rglob("*.opt-[12].pyc"):
         opt_pyc.unlink()
 
@@ -687,10 +688,11 @@ def build_python314(env: dict[str, str]) -> None:
                 txt.replace(str(USR_DIR), "/usr")
                 .replace(str(DEPS_PREFIX), "/usr")
                 .replace(str(BUILD_DIR), "/tmp")
+                .replace("/home/runner", "/root")
             )
             meta_file.write_text(txt, encoding="utf-8")
 
-    # Set clean $ORIGIN RUNPATHs via patchelf (avoids GNU Make expanding $O in $ORIGIN)
+    # Set clean $ORIGIN RUNPATHs via patchelf
     patchelf = shutil.which("patchelf")
     assert patchelf, "patchelf is required on the build host"
     run(
@@ -716,7 +718,7 @@ def build_python314(env: dict[str, str]) -> None:
 
 
 def install_proot_distro_and_certs(resolved: dict) -> None:
-    """Installs unmodified proot-distro v5.x, CA certificates, and relocatable launcher."""
+    """Installs proot-distro v5.x, __main__.py entrypoint, CA certificates, and relocatable launcher."""
     site_pkgs = USR_DIR / "lib/python3.14/site-packages"
     site_pkgs.mkdir(parents=True, exist_ok=True)
 
@@ -726,6 +728,12 @@ def install_proot_distro_and_certs(resolved: dict) -> None:
     if dest_pd.exists():
         shutil.rmtree(dest_pd)
     shutil.copytree(pd_src, dest_pd)
+
+    # Add __main__.py so both `python3 -m proot_distro` and console entrypoints invoke cli.main()
+    (dest_pd / "__main__.py").write_text(
+        "import sys\nfrom proot_distro.cli import main\n\nif __name__ == '__main__':\n    sys.exit(main())\n",
+        encoding="utf-8",
+    )
 
     pd_ver = resolved["proot_distro"]
     dist_info = site_pkgs / f"proot_distro-{pd_ver}.dist-info"
@@ -758,7 +766,7 @@ def install_proot_distro_and_certs(resolved: dict) -> None:
         'export PYTHONHOME="$USR_PREFIX"\n'
         'export PYTHONUTF8="1"\n'
         'export LD_LIBRARY_PATH="$USR_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
-        'exec "$USR_PREFIX/bin/python3" -m proot_distro.cli "$@"\n',
+        'exec "$USR_PREFIX/bin/python3" -c "import sys; from proot_distro.cli import main; sys.exit(main())" "$@"\n',
         encoding="utf-8",
     )
     pd_bin.chmod(0o755)
@@ -793,11 +801,7 @@ def package_and_manifest(resolved: dict) -> None:
 
     sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     size_bytes = archive_path.stat().st_size
-    download_url = (
-        f"https://github.com/{GITHUB_REPOSITORY}/releases/latest/download/{ARCHIVE_NAME}"
-        if RELEASE_TAG == "latest"
-        else f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{RELEASE_TAG}/{ARCHIVE_NAME}"
-    )
+    download_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/latest/download/{ARCHIVE_NAME}"
 
     manifest = {
         "version": version_str,
