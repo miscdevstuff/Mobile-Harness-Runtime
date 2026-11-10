@@ -91,7 +91,7 @@ def resolve_branch_head_sha(repo: str, branch: str = "master") -> str:
 def resolve_github_release_tarball(
     name: str, repo: str, asset_prefix: str
 ) -> dict[str, str]:
-    """Resolves the latest GitHub release and prefers uploaded .tar.gz release assets (with prebuilt configure)."""
+    """Resolves the latest GitHub release and prefers uploaded .tar.gz release assets."""
     try:
         rel = github_api_get(f"https://api.github.com/repos/{repo}/releases/latest")
         tag = rel.get("tag_name", "")
@@ -109,6 +109,36 @@ def resolve_github_release_tarball(
             f"[warn] Could not resolve latest GitHub release for {name} ({exc}), using fallback"
         )
     return FALLBACK_DEPS[name]
+
+
+def resolve_latest_openssl_3x() -> dict[str, str]:
+    """Resolves the latest stable OpenSSL 3.x release (CPython 3.14 requires OpenSSL 3.x symbols)."""
+    try:
+        releases = github_api_get(
+            f"https://api.github.com/repos/{GITHUB_REPOS['openssl']}/releases?per_page=30"
+        )
+        candidates = []
+        for rel in releases:
+            if rel.get("draft") or rel.get("prerelease"):
+                continue
+            tag = rel.get("tag_name", "")
+            m = re.match(r"^openssl-(3\.\d+\.\d+)$", tag)
+            if not m:
+                continue
+            ver = m.group(1)
+            for asset in rel.get("assets", []):
+                aname = asset.get("name", "")
+                if aname == f"openssl-{ver}.tar.gz":
+                    candidates.append(
+                        (parse_ver_tuple(ver), ver, asset["browser_download_url"])
+                    )
+        if candidates:
+            candidates.sort()
+            _, ver, url = candidates[-1]
+            return {"version": ver, "url": url}
+    except Exception as exc:
+        print(f"[warn] Could not resolve OpenSSL 3.x release ({exc}), using fallback")
+    return FALLBACK_DEPS["openssl"]
 
 
 def resolve_latest_sqlite() -> dict[str, str]:
@@ -164,9 +194,7 @@ def resolve_all_static_deps() -> dict[str, dict[str, str]]:
         "libffi": resolve_github_release_tarball(
             "libffi", GITHUB_REPOS["libffi"], "libffi-"
         ),
-        "openssl": resolve_github_release_tarball(
-            "openssl", GITHUB_REPOS["openssl"], "openssl-"
-        ),
+        "openssl": resolve_latest_openssl_3x(),
         "sqlite": resolve_latest_sqlite(),
         "talloc": resolve_latest_talloc(),
         "bzip2": resolve_latest_bzip2(),

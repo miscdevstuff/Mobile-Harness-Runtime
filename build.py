@@ -67,8 +67,8 @@ def make_ndk_env(toolchain: Path) -> dict[str, str]:
     strip = str(bin_dir / "llvm-strip")
     readelf = str(bin_dir / "llvm-readelf")
 
-    cflags = f"-O2 -fPIC -I{DEPS_PREFIX}/include"
-    ldflags = f"-L{DEPS_PREFIX}/lib {PAGE_SIZE_LDFLAGS}"
+    cflags = f"-O2 -fPIC -ffunction-sections -fdata-sections -I{DEPS_PREFIX}/include"
+    ldflags = f"-L{DEPS_PREFIX}/lib -Wl,--gc-sections {PAGE_SIZE_LDFLAGS}"
 
     env = os.environ.copy()
     env.update(
@@ -162,7 +162,7 @@ def build_static_deps(env: dict[str, str]) -> None:
             f"CC={env['CC']}",
             f"AR={env['AR']}",
             f"RANLIB={env['RANLIB']}",
-            "CFLAGS=-O2 -fPIC -D_FILE_OFFSET_BITS=64",
+            "CFLAGS=-O2 -fPIC -ffunction-sections -fdata-sections -D_FILE_OFFSET_BITS=64",
         ],
         cwd=bz2_src,
         env=env,
@@ -183,7 +183,7 @@ def build_static_deps(env: dict[str, str]) -> None:
             "libzstd.pc",
             f"CC={env['CC']}",
             f"AR={env['AR']}",
-            "CFLAGS=-O3 -fPIC",
+            "CFLAGS=-O3 -fPIC -ffunction-sections -fdata-sections",
             f"PREFIX={DEPS_PREFIX}",
         ],
         cwd=zstd_src,
@@ -227,6 +227,8 @@ def build_static_deps(env: dict[str, str]) -> None:
             env["CC"],
             "-O2",
             "-fPIC",
+            "-ffunction-sections",
+            "-fdata-sections",
             "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_RTREE",
             "-DSQLITE_ENABLE_JSON1",
@@ -254,7 +256,7 @@ def build_static_deps(env: dict[str, str]) -> None:
     shutil.copy2(sqlite_src / "sqlite3ext.h", DEPS_PREFIX / "include/sqlite3ext.h")
     write_pkgconfig("sqlite3", "SQLite database engine", "3.49.1", "-lsqlite3 -lm")
 
-    # 7. OpenSSL (static libcrypto.a & libssl.a)
+    # 7. OpenSSL 3.x (static libcrypto.a & libssl.a with -ffunction-sections -fdata-sections)
     ssl_src = SRC_DIR / "openssl"
     run(
         [
@@ -267,7 +269,10 @@ def build_static_deps(env: dict[str, str]) -> None:
             "no-tests",
             "no-ui-console",
             "no-docs",
+            "no-legacy",
             "-fPIC",
+            "-ffunction-sections",
+            "-fdata-sections",
         ],
         cwd=ssl_src,
         env=env,
@@ -288,11 +293,7 @@ def build_static_deps(env: dict[str, str]) -> None:
 
 def patch_proot_sources(proot_src: Path) -> None:
     """Applies /proc/self/exe relative path fallbacks to proot for loader and temp dir."""
-    temp_c = proot_src / "src/path/temp.c"
-    if temp_c.is_file():
-        txt = temp_c.read_text(encoding="utf-8")
-        if "MH_REL_TMP_PATCH" not in txt:
-            helper = r"""
+    rel_tmp_helper = r"""
 /* MH_REL_TMP_PATCH */
 #include <stdlib.h>
 #include <string.h>
@@ -301,6 +302,8 @@ def patch_proot_sources(proot_src: Path) -> None:
 #include <sys/stat.h>
 static const char *mh_default_tmp_dir(void) {
     static char buf[PATH_MAX];
+    const char *env_tmp = getenv("PROOT_TMP_DIR");
+    if (env_tmp && env_tmp[0] != '\0') return env_tmp;
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (len > 0) {
         buf[len] = '\0';
@@ -318,8 +321,17 @@ static const char *mh_default_tmp_dir(void) {
     return "/tmp";
 }
 """
-            txt = helper + "\n" + txt.replace('"/tmp"', "mh_default_tmp_dir()", 1)
-            temp_c.write_text(txt, encoding="utf-8")
+    for rel_path in ["src/path/temp.c", "src/path/f2fs-bug.c"]:
+        target_c = proot_src / rel_path
+        if target_c.is_file():
+            txt = target_c.read_text(encoding="utf-8")
+            if "MH_REL_TMP_PATCH" not in txt:
+                txt = (
+                    rel_tmp_helper
+                    + "\n"
+                    + txt.replace('"/tmp"', "mh_default_tmp_dir()")
+                )
+                target_c.write_text(txt, encoding="utf-8")
 
     loader_helper = r"""
 /* MH_REL_LOADER_PATCH */
@@ -515,7 +527,7 @@ def build_proot(env: dict[str, str], resolved: dict) -> None:
         encoding="utf-8",
     )
 
-    # 5. Collect proot C sources (from GNUmakefile if present, else standard list)
+    # 5. Collect proot C sources
     gnumakefile = proot_src / "src/GNUmakefile"
     src_paths: list[str] = []
     if gnumakefile.is_file():
@@ -572,7 +584,7 @@ def build_proot(env: dict[str, str], resolved: dict) -> None:
 
 
 def build_python314(env: dict[str, str]) -> None:
-    """Cross-compiles Python 3.14.x with static OpenSSL/Zstd/LZMA/Bzip2/FFI/SQLite."""
+    """Cross-compiles Python 3.14.x with static OpenSSL 3.x/Zstd/LZMA/Bzip2/FFI/SQLite."""
     py_src = SRC_DIR / "cpython"
     build_py = shutil.which("python3.14") or shutil.which("python3")
     assert build_py, "Host python3.14 is required for cross-compiling CPython 3.14"
@@ -599,10 +611,7 @@ def build_python314(env: dict[str, str]) -> None:
     py_env = env.copy()
     py_env["CONFIG_SITE"] = str(config_site)
     py_env["PKG_CONFIG"] = str(pkg_config_static)
-    py_env["LDFLAGS"] = (
-        f"-L{DEPS_PREFIX}/lib {PAGE_SIZE_LDFLAGS} "
-        "-Wl,-rpath,\\$ORIGIN/../lib -Wl,--enable-new-dtags"
-    )
+    py_env["LDFLAGS"] = f"-L{DEPS_PREFIX}/lib -Wl,--gc-sections {PAGE_SIZE_LDFLAGS}"
 
     run(
         [
@@ -628,8 +637,35 @@ def build_python314(env: dict[str, str]) -> None:
     if not py3_link.exists():
         py3_link.symlink_to("python3.14")
 
+    # Remove unneeded build-time headers, manpages, pkgconfig, and scripts with hardcoded build-host shebangs
+    for rel_remove in ["include", "share", "lib/pkgconfig"]:
+        target = USR_DIR / rel_remove
+        if target.exists():
+            shutil.rmtree(target)
+
+    for script_name in [
+        "idle3",
+        "idle3.14",
+        "pydoc3",
+        "pydoc3.14",
+        "python3-config",
+        "python3.14-config",
+    ]:
+        p = USR_DIR / "bin" / script_name
+        if p.exists() or p.is_symlink():
+            p.unlink()
+
     py_lib = USR_DIR / "lib/python3.14"
-    for bloat in ["idlelib", "tkinter", "turtledemo", "test", "pydoc_data"]:
+    for bloat in [
+        "idlelib",
+        "tkinter",
+        "turtledemo",
+        "test",
+        "pydoc_data",
+        "ensurepip",
+        "unittest",
+        "venv",
+    ]:
         target = py_lib / bloat
         if target.is_dir():
             shutil.rmtree(target)
@@ -637,6 +673,39 @@ def build_python314(env: dict[str, str]) -> None:
         if cfg_dir.is_dir():
             shutil.rmtree(cfg_dir)
 
+    # Remove duplicate .opt-1.pyc and .opt-2.pyc bytecode files to save ~4 MB
+    for opt_pyc in py_lib.rglob("*.opt-[12].pyc"):
+        opt_pyc.unlink()
+
+    # Scrub /home/runner build paths from _sysconfigdata and build-details.json
+    for meta_file in list(py_lib.glob("_sysconfig*")) + list(
+        py_lib.glob("build-details.json")
+    ):
+        if meta_file.is_file():
+            txt = meta_file.read_text(encoding="utf-8", errors="replace")
+            txt = (
+                txt.replace(str(USR_DIR), "/usr")
+                .replace(str(DEPS_PREFIX), "/usr")
+                .replace(str(BUILD_DIR), "/tmp")
+            )
+            meta_file.write_text(txt, encoding="utf-8")
+
+    # Set clean $ORIGIN RUNPATHs via patchelf (avoids GNU Make expanding $O in $ORIGIN)
+    patchelf = shutil.which("patchelf")
+    assert patchelf, "patchelf is required on the build host"
+    run(
+        [patchelf, "--set-rpath", "$ORIGIN/../lib", str(USR_DIR / "bin/python3.14")],
+        cwd=ROOT_DIR,
+    )
+    for lib_so in ["libpython3.14.so", "libpython3.so"]:
+        p = USR_DIR / "lib" / lib_so
+        if p.is_file() and not p.is_symlink():
+            run([patchelf, "--set-rpath", "$ORIGIN", str(p)], cwd=ROOT_DIR)
+    for ext_so in (py_lib / "lib-dynload").glob("*.so"):
+        if ext_so.is_file() and not ext_so.is_symlink():
+            run([patchelf, "--set-rpath", "$ORIGIN/../..", str(ext_so)], cwd=ROOT_DIR)
+
+    # Strip libpython and C extensions
     strip = env["STRIP"]
     for so_file in USR_DIR.rglob("*.so*"):
         if so_file.is_file() and not so_file.is_symlink():
@@ -688,6 +757,7 @@ def install_proot_distro_and_certs(resolved: dict) -> None:
         'export SSL_CERT_FILE="${SSL_CERT_FILE:-$USR_PREFIX/etc/tls/cert.pem}"\n'
         'export PYTHONHOME="$USR_PREFIX"\n'
         'export PYTHONUTF8="1"\n'
+        'export LD_LIBRARY_PATH="$USR_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
         'exec "$USR_PREFIX/bin/python3" -m proot_distro.cli "$@"\n',
         encoding="utf-8",
     )
