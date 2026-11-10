@@ -64,11 +64,20 @@ jobs:
           RELEASE_TAG: ${{ steps.rel.outputs.tag }}
         run: python3 build.py
 
-      - name: Publish GitHub Release
+      - name: Remove previous releases so only the latest release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for old_tag in $(gh release list --repo "${{ github.repository }}" --limit 100 --json tagName -q '.[].tagName'); do
+            echo "Deleting previous release and tag: $old_tag"
+            gh release delete "$old_tag" --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          done
+
+      - name: Publish Latest GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.rel.outputs.tag }}
-          name: "Mobile Harness Host Runtime ${{ steps.rel.outputs.tag }}"
+          name: "Mobile Harness Host Runtime (${{ steps.rel.outputs.tag }})"
           make_latest: true
           files: |
             dist/mh-host-runtime-arm64.tar.zst
