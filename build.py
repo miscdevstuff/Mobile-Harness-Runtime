@@ -664,8 +664,6 @@ def build_python314(env: dict[str, str]) -> None:
         "test",
         "pydoc_data",
         "ensurepip",
-        "unittest",
-        "venv",
     ]:
         target = py_lib / bloat
         if target.is_dir():
